@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""
+flow_collector.py — Poll a Nexus switch over SSH and dump DPU flow tables.
+
+Runs `slot 1 dpu N dpctl show flow` for N in 1..4 every CYCLE seconds and
+writes the combined output to a timestamped text file. Designed to feed
+flow_to_intent.py downstream.
+
+The output format mirrors what a human would see typing the commands at the
+NX-OS prompt: each DPU section is preceded by the command line, so the
+downstream tool can section-gate by command. Absent DPUs are skipped
+silently (Cisco prints "DPU N is absent").
+
+Cross-platform: works on Windows and Linux. Uses only stdlib plus paramiko.
+
+USAGE:
+    python flow_collector.py --host a2-asw-nx04 --user admin \\
+        --interval 60 --output-dir ./captures
+
+    # Password from environment (recommended for unattended runs):
+    set NXOS_PASSWORD=...    # Windows
+    export NXOS_PASSWORD=...  # Linux
+
+    # Stop with Ctrl-C; in-flight cycle finishes before exit.
+    # Optional --duration to run for a fixed wall-clock window.
+"""
+
+import argparse
+import getpass
+import os
+import re
+import signal
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+try:
+    import paramiko
+except ImportError:
+    sys.exit("paramiko is required. Install with:  pip install paramiko")
+
+
+# ----- globals for graceful shutdown -----
+_halt_requested = False
+
+
+def _sigint_handler(signum, frame):
+    global _halt_requested
+    _halt_requested = True
+    print("\n[halt requested — finishing current cycle then exiting]", flush=True)
+
+
+def open_ssh(host, user, password, port=22, timeout=15):
+    """Open an interactive SSH shell to the switch. Returns (client, channel)."""
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(
+        hostname=host,
+        port=port,
+        username=user,
+        password=password,
+        timeout=timeout,
+        look_for_keys=False,
+        allow_agent=False,
+    )
+    chan = client.invoke_shell(width=512, height=10000)
+    chan.settimeout(timeout)
+    # Drain the login banner.
+    _read_until_prompt(chan, timeout=timeout)
+    # Disable pagination so we don't have to handle --More-- prompts.
+    chan.send("terminal length 0\n")
+    _read_until_prompt(chan, timeout=timeout)
+    return client, chan
+
+
+_PROMPT_RE = re.compile(rb"[A-Za-z0-9._-]+#\s*$")
+
+
+def _read_until_prompt(chan, timeout=30):
+    """Read from the channel until we see a top-level NX-OS prompt at EOL."""
+    buf = b""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if chan.recv_ready():
+            chunk = chan.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+            # Check the tail of what we've got for the prompt.
+            tail = buf.split(b"\n")[-1]
+            if _PROMPT_RE.search(tail):
+                return buf.decode("utf-8", errors="replace")
+        else:
+            time.sleep(0.05)
+    return buf.decode("utf-8", errors="replace")
+
+
+def run_command(chan, command, timeout=120):
+    """Send a command, return the full output (including the echoed command)."""
+    chan.send(command + "\n")
+    return _read_until_prompt(chan, timeout=timeout)
+
+
+def collect_cycle(chan, max_dpus=4, command_timeout=120):
+    """Run dpctl show flow on DPUs 1..max_dpus. Return concatenated output."""
+    parts = []
+    for n in range(1, max_dpus + 1):
+        cmd = f"slot 1 dpu {n} dpctl show flow"
+        out = run_command(chan, cmd, timeout=command_timeout)
+        # The output already includes the echoed command and final prompt;
+        # we keep it verbatim so the downstream section-gate sees the command.
+        parts.append(out)
+        # If absent, the response will contain "DPU N is absent" — that's fine,
+        # downstream tooling will ignore the section since it won't see flow rows.
+    return "".join(parts)
+
+
+def write_cycle_file(output_dir: Path, content: str, cycle_started_at: datetime) -> Path:
+    # ISO-8601-ish, filesystem-safe (no colons — Windows blocks them).
+    stamp = cycle_started_at.strftime("%Y-%m-%dT%H-%M-%SZ")
+    path = output_dir / f"flowcap_{stamp}.txt"
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument("--host", required=True, help="Switch hostname or IP")
+    ap.add_argument("--user", required=True, help="SSH username")
+    ap.add_argument(
+        "--port", type=int, default=22, help="SSH port (default 22)"
+    )
+    ap.add_argument(
+        "--interval", type=int, default=60,
+        help="Seconds between cycle starts (default 60). If a cycle takes "
+             "longer than this, the next cycle starts immediately.",
+    )
+    ap.add_argument(
+        "--output-dir", default="./captures",
+        help="Directory to write per-cycle files (default ./captures)",
+    )
+    ap.add_argument(
+        "--max-dpus", type=int, default=4,
+        help="Highest DPU number to query (default 4). Absent DPUs are "
+             "captured but produce no flow rows; downstream tools skip them.",
+    )
+    ap.add_argument(
+        "--duration", type=int, default=0,
+        help="Run for this many seconds, then exit cleanly. 0 = run until "
+             "Ctrl-C (default).",
+    )
+    ap.add_argument(
+        "--command-timeout", type=int, default=120,
+        help="Per-command timeout in seconds (default 120)",
+    )
+    args = ap.parse_args()
+
+    password = os.environ.get("NXOS_PASSWORD")
+    if not password:
+        password = getpass.getpass(f"Password for {args.user}@{args.host}: ")
+    if not password:
+        sys.exit("No password supplied; aborting.")
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+
+    print(f"[collector] host={args.host} user={args.user} "
+          f"interval={args.interval}s output={output_dir}", flush=True)
+    print(f"[collector] connecting...", flush=True)
+    client, chan = open_ssh(args.host, args.user, password, port=args.port)
+    print(f"[collector] connected; collecting every {args.interval}s. "
+          f"Ctrl-C to stop.", flush=True)
+
+    start_wall = time.monotonic()
+    deadline = start_wall + args.duration if args.duration > 0 else None
+    cycle_num = 0
+
+    try:
+        while True:
+            if _halt_requested:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                print("[collector] duration reached; exiting.", flush=True)
+                break
+
+            cycle_num += 1
+            cycle_started_at = datetime.now(timezone.utc)
+            t0 = time.monotonic()
+            try:
+                content = collect_cycle(
+                    chan,
+                    max_dpus=args.max_dpus,
+                    command_timeout=args.command_timeout,
+                )
+                path = write_cycle_file(output_dir, content, cycle_started_at)
+                elapsed = time.monotonic() - t0
+                # Quick row count for the operator's sanity.
+                row_count = sum(
+                    1 for line in content.splitlines()
+                    if re.match(r"^\s*\d+\s+0x[0-9a-fA-F]+", line)
+                )
+                print(f"[cycle {cycle_num}] {path.name}  "
+                      f"{row_count} flow rows  ({elapsed:.1f}s)",
+                      flush=True)
+            except (paramiko.SSHException, OSError) as e:
+                # SSH dropped or timed out. Try to reconnect once.
+                print(f"[cycle {cycle_num}] error: {e}; reconnecting...",
+                      flush=True)
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                time.sleep(2)
+                client, chan = open_ssh(
+                    args.host, args.user, password, port=args.port
+                )
+                print(f"[collector] reconnected.", flush=True)
+                continue
+
+            # Sleep until next cycle start, but check halt every second so
+            # Ctrl-C is responsive.
+            next_start = t0 + args.interval
+            while time.monotonic() < next_start:
+                if _halt_requested:
+                    break
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
+                time.sleep(min(1.0, max(0.05, next_start - time.monotonic())))
+
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+        print(f"[collector] done. {cycle_num} cycles written to {output_dir}",
+              flush=True)
+
+
+if __name__ == "__main__":
+    main()
