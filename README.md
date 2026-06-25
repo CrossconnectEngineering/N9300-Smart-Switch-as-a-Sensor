@@ -1,18 +1,20 @@
 # N9300-Smart-Switch-as-a-Sensor
 # Hypershield Flow Capture & Policy Import Toolchain
-Capture live flow data from a Nexus Smart Switch, distill it into a declarative intent table, and push the result into Security Cloud Control as a draft Hypershield policy group.
-```
+
+Capture live flow data from a Nexus Smart Switch, distill it into a declarative intent table, and push the result into Hypershield as a draft policy group.
+
+```text
 ┌──────────────┐    ┌──────────────────┐    ┌─────────────────────┐    ┌────────────────────────┐
-│ Nexus Switch │ →  │ flow_collector.py│ →  │ flow_to_hs.py   │ →  │ import_hs_policy_csv.py│ →  SCC draft policy
+│ Nexus Switch │ →  │ flow_collector.py│ →  │ flow_to_hs.py       │ →  │ import_hs_policy_csv.py│ →  HS draft policy
 └──────────────┘    └──────────────────┘    └─────────────────────┘    └────────────────────────┘
-                          (over SSH)         (intent.xlsx + CSVs)            (HTTPS to SCC)
+                          (over SSH)         (intent.xlsx + CSVs)            (gRPC to HS)
 ```
 
 ## Setup
 
 Cross-platform (Windows, Linux, macOS). Python 3.9+.
 
-```
+```bash
 python -m pip install paramiko openpyxl
 ```
 
@@ -30,7 +32,7 @@ the in-flight cycle and exits cleanly.
 
 ### Usage
 
-```
+```bash
 python flow_collector.py --host 10.3.7.206 --user admin --interval 60 --output-dir .\captures
 ```
 
@@ -61,11 +63,11 @@ Identical source-sets and identical port-sets collapse into single rows.
 
 ### Usage
 
-```
-python flow_to_hs.py .\captures -o intent.xlsx --scc-csv-dir .\scc_import
+```bash
+python flow_to_hs.py .\captures -o intent.xlsx --hs-csv-dir .\hs_import
 ```
 
-The `--scc-csv-dir` is optional. Omit it if you only want the xlsx review
+The `--hs-csv-dir` flag is optional. Omit it if you only want the xlsx review
 artifact. When supplied, that directory is **cleared and rebuilt on every
 run** — each run is a fresh draft.
 
@@ -75,22 +77,22 @@ run** — each run is a fresh draft.
   PROTOCOL [PORTS]) plus an "Unconfirmed Flows" sheet listing flows seen
   attempting but never completing (policy candidates to investigate, not
   to write).
-- `scc_import\network_objects.csv` — one row per unique IP-set
-- `scc_import\policies.csv` — one row per (intent_row × port_tag)
-- `scc_import\policy_group.csv` — timestamped draft group name
+- `hs_import\network_objects.csv` — one row per unique IP-set
+- `hs_import\policies.csv` — one row per (intent_row × port_tag)
+- `hs_import\policy_group.csv` — timestamped draft group name
 
 ---
 
-## 3. `import_hs_policy_csv.py` — upload to SCC
+## 3. `import_hs_policy_csv.py` — upload to Hypershield
 
 Creates the network objects, creates a draft policy group, and stages every
-policy into that group. **Does not deploy** — you review and push in the SCC
-UI when ready.
+policy into that group. **Does not deploy** — you review and push in the
+Hypershield UI when ready.
 
 ### Dry run first
 
-```
-python import_hs_policy_csv.py --objects-csv .\scc_import\network_objects.csv --policies-csv .\scc_import\policies.csv --policy-group-csv .\scc_import\policy_group.csv --dry-run --output-json plan.json
+```bash
+python import_hs_policy_csv.py --objects-csv .\hs_import\network_objects.csv --policies-csv .\hs_import\policies.csv --policy-group-csv .\hs_import\policy_group.csv --dry-run --output-json plan.json
 ```
 
 Logs every API call it *would* make to `plan.json` without sending anything.
@@ -98,41 +100,39 @@ Inspect `plan.json` and `intent.xlsx`; both should make sense before you go live
 
 ### Live run
 
-Three environment variables, then the same command without `--dry-run`:
+Set the Hypershield MP API URL and access token, then run the same command without `--dry-run`:
 
-```
-$env:SCC_API_URL = "https://www.defenseorchestrator.com"
+```powershell
 $env:HS_MP_API_URL = "https://<your-hs-mp-host>/api"
-$env:SCC_ACCESS_TOKEN = "<your-token>"
-python import_hs_policy_csv.py --objects-csv .\scc_import\network_objects.csv --policies-csv .\scc_import\policies.csv --policy-group-csv .\scc_import\policy_group.csv --output-json result.json
+$env:HS_ACCESS_TOKEN = "<your-token>"
+
+python import_hs_policy_csv.py --objects-csv .\hs_import\network_objects.csv --policies-csv .\hs_import\policies.csv --policy-group-csv .\hs_import\policy_group.csv --output-json result.json
 ```
 
-`SCC_API_URL` is the SCC region root (`.com`, `.eu`, etc.).
 `HS_MP_API_URL` ends in `/api`.
-`SCC_ACCESS_TOKEN` is an API token from SCC → profile → API Tokens.
-The token must have a role permitting Hypershield policy edit.
+`HS_ACCESS_TOKEN` is an API token with permission to edit Hypershield policy.
 
 ---
 
 ## End-to-end example
 
-```
+```powershell
 # 1. Capture for 30 minutes
 python flow_collector.py --host 10.3.7.206 --user admin --interval 60 --duration 1800 --output-dir .\captures
 
-# 2. Build intent table + SCC CSVs
-python flow_to_hs.py .\captures -o intent.xlsx --scc-csv-dir .\scc_import
+# 2. Build intent table + HS CSVs
+python flow_to_hs.py .\captures -o intent.xlsx --hs-csv-dir .\hs_import
 
 # 3. Dry-run the upload
-python import_hs_policy_csv.py --objects-csv .\scc_import\network_objects.csv --policies-csv .\scc_import\policies.csv --policy-group-csv .\scc_import\policy_group.csv --dry-run --output-json plan.json
+python import_hs_policy_csv.py --objects-csv .\hs_import\network_objects.csv --policies-csv .\hs_import\policies.csv --policy-group-csv .\hs_import\policy_group.csv --dry-run --output-json plan.json
 
 # 4. Inspect intent.xlsx and plan.json. Look for surprises.
 
-# 5. Live push to SCC (creates draft, does NOT deploy)
-$env:SCC_API_URL = "https://www.defenseorchestrator.com"
+# 5. Live push to Hypershield creates draft, does NOT deploy
 $env:HS_MP_API_URL = "https://<your-hs-mp-host>/api"
-$env:SCC_ACCESS_TOKEN = "<your-token>"
-python import_hs_policy_csv.py --objects-csv .\scc_import\network_objects.csv --policies-csv .\scc_import\policies.csv --policy-group-csv .\scc_import\policy_group.csv --output-json result.json
+$env:HS_ACCESS_TOKEN = "<your-token>"
 
-# 6. Review and deploy the draft in the SCC UI.
+python import_hs_policy_csv.py --objects-csv .\hs_import\network_objects.csv --policies-csv .\hs_import\policies.csv --policy-group-csv .\hs_import\policy_group.csv --output-json result.json
+
+# 6. Review and deploy the draft in the Hypershield UI.
 ```
