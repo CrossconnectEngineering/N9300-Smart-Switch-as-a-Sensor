@@ -239,7 +239,5 @@ def main():
             pass
         print(f"[collector] done. {cycle_num} cycles written to {output_dir}",
               flush=True)
-
-
 if __name__ == "__main__":
     main()
