@@ -431,6 +431,15 @@ def write_hs_csvs(rows, output_dir: Path):
     # ---- policies.csv ----
     # One policy per intent row. Multiple rules per policy when the row has
     # multiple port tags. policy_key is shared across the row's rules.
+    #
+    # UDP statelessness: Hypershield currently treats UDP as stateless, so a
+    # one-way permit is insufficient — the responder traffic gets dropped at
+    # the enforcement point unless an explicit reverse permit exists. For
+    # every UDP rule we emit, we ALSO emit the reverse direction with the
+    # objects swapped and destination_port left blank (the importer treats
+    # blank as "any", which is the operationally correct shape since the
+    # responder uses whatever ephemeral port was on the initiator side).
+    # TCP and ICMP are stateful in this build and need only the forward rule.
     pol_path = output_dir / "policies.csv"
     with pol_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -448,6 +457,7 @@ def write_hs_csvs(rows, output_dir: Path):
                 proto, dport = _parse_port_tag(tag)
                 if proto is None:
                     continue
+                # Forward permit (always emitted).
                 w.writerow([
                     policy_key, policy_name, "",
                     "permit", "nolog",
@@ -457,6 +467,25 @@ def write_hs_csvs(rows, output_dir: Path):
                     dport,
                     "",        # policy_id: assigned by HS-MP-API
                 ])
+                # Reverse permit (UDP only — TCP/ICMP are stateful).
+                # Must be its own policy_key: the importer requires
+                # source_object/destination_object to be consistent across
+                # all rules sharing one policy_key. We mark it _REV and
+                # restore the description for auditability.
+                if proto == "udp":
+                    reverse_key = f"{policy_key}_REV"
+                    w.writerow([
+                        reverse_key, reverse_key,
+                        "UDP reverse permit (Hypershield UDP is stateless)",
+                        "permit", "nolog",
+                        dst_key, src_key,
+                        proto,
+                        "",    # source_port: ephemeral on the responder side
+                        "",    # destination_port: any (responder traffic
+                               # returns to whatever ephemeral port the
+                               # initiator was using; blank = any)
+                        "",
+                    ])
 
     # ---- policy_group.csv ----
     pg_path = output_dir / "policy_group.csv"
