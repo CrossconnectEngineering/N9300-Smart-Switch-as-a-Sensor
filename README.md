@@ -1,34 +1,46 @@
 # N9300-Smart-Switch-as-a-Sensor
 # Hypershield Flow Capture & Policy Import Toolchain
 
-Capture live flow data from a Nexus Smart Switch, distill it into a declarative intent table, and push the result into Hypershield as a draft policy group.
+Capture live flow data from a Nexus Smart Switch, distill it into a declarative intent table, and create the corresponding resources in Hypershield.
 
 ```text
-┌──────────────┐    ┌──────────────────┐    ┌─────────────────────┐    ┌────────────────────────┐
-│ Nexus Switch │ →  │ flow_collector.py│ →  │ flow_to_hs.py       │ →  │ import_hs_policy_csv.py│ →  HS draft policy
-└──────────────┘    └──────────────────┘    └─────────────────────┘    └────────────────────────┘
-                          (over SSH)         (intent.xlsx + CSVs)            (gRPC to HS)
++--------------+    +-------------------+    +---------------+    +---------------------+
+| Nexus Switch | -> | flow_collector.py | -> | flow_to_hs.py | -> | import_hs_policy.py |
++--------------+    +-------------------+    +---------------+    +---------------------+
+                         (over SSH)          (xlsx + CSVs)          (gRPC to HS)
 ```
 
 ## Setup
 
-Cross-platform (Windows, Linux, macOS). Python 3.9+.
+Cross-platform (Windows, Linux, macOS). Python 3.10 or later — the tools use `X | None` type syntax, which raises a `TypeError` on import under 3.9.
+
+Dependencies are per tool, so install only what the step needs:
 
 ```bash
-python -m pip install paramiko openpyxl
+python -m pip install paramiko    # flow_collector.py, for SSH
+python -m pip install openpyxl    # flow_to_hs.py, for the xlsx workbook
 ```
 
-The third script (`import_hs_policy_csv.py`) uses only the Python standard
-library — no extra installs.
+`import_hs_policy.py` uses only the Python standard library, but it shells out to [`grpcurl`](https://github.com/fullstorydev/grpcurl). Install `grpcurl` and put it on `PATH` before a live import.
+
+### Reaching the gRPC service
+
+`grpcurl` speaks native gRPC and addresses a method at the root of a host and port. It cannot reach a service published under a path prefix. Pass `--srv` the address and port where the intent service itself listens — commonly a NodePort such as `32000` — rather than the management UI address.
+
+If `grpcurl -insecure <host>:<port> list` returns
+
+```text
+Failed to list services: rpc error: code = Unavailable desc = upstream connect error
+or disconnect/reset before headers. reset reason: protocol error
+```
+
+then something is answering on that port but it is not the gRPC service — usually the management ingress. Find the address and port where the service is exposed directly and use that.
 
 ---
 
 ## 1. `flow_collector.py` — capture flow data
 
-Logs into a Nexus switch over SSH and runs `slot 1 dpu N dpctl show flow`
-for N=1..4 every X seconds. Writes one timestamped text file per cycle.
-Handles absent DPUs silently. Auto-reconnects on SSH drop. Ctrl-C finishes
-the in-flight cycle and exits cleanly.
+Logs into a Nexus switch over SSH and runs `slot 1 dpu N dpctl show flow` for N=1..4 every X seconds. Writes one timestamped text file per cycle. Handles absent DPUs silently. Auto-reconnects on SSH drop. Ctrl-C finishes the in-flight cycle and exits cleanly.
 
 ### Usage
 
@@ -46,18 +58,13 @@ Prompts for the password, or set `NXOS_PASSWORD` env var to skip the prompt.
 
 ### Output
 
-`.\captures\flowcap_2026-05-13T18-45-00Z.txt` per cycle. Feed the whole
-directory to `flow_to_hs.py`.
+`.\captures\flowcap_2026-05-13T18-45-00Z.txt` per cycle. Feed the whole directory to `flow_to_hs.py`.
 
 ---
 
 ## 2. `flow_to_hs.py` — build the policy intent
 
-Reads a directory of capture files and applies bidirectional confirmation:
-a flow is a policy candidate only if it was observed completing in at least
-one snapshot (initiator + matching responder). Flows that stay one-sided
-across the entire capture window are evidence of blocked or unanswered
-traffic and are *not* written into policy.
+Reads a directory of capture files and applies bidirectional confirmation: a flow is a policy candidate only if it was observed completing in at least one snapshot (initiator + matching responder). Flows that stay one-sided across the entire capture window are evidence of blocked or unanswered traffic and are *not* written into policy.
 
 Identical source-sets and identical port-sets collapse into single rows.
 
@@ -67,50 +74,66 @@ Identical source-sets and identical port-sets collapse into single rows.
 python flow_to_hs.py .\captures -o intent.xlsx --hs-csv-dir .\hs_import
 ```
 
-The `--hs-csv-dir` flag is optional. Omit it if you only want the xlsx review
-artifact. When supplied, that directory is **cleared and rebuilt on every
-run** — each run is a fresh draft.
+The `--hs-csv-dir` flag is optional. Omit it if you only want the xlsx review artifact. When supplied, that directory is **cleared and rebuilt on every run** — each run is a fresh export.
 
 ### Output
 
-- `intent.xlsx` — human-readable intent table (Source, Destination,
-  PROTOCOL [PORTS]) plus an "Unconfirmed Flows" sheet listing flows seen
-  attempting but never completing (policy candidates to investigate, not
-  to write).
+- `intent.xlsx` — human-readable intent table (Source, Destination, PROTOCOL [PORTS]) plus an "Unconfirmed Flows" sheet listing flows seen attempting but never completing (policy candidates to investigate, not to write).
 - `hs_import\network_objects.csv` — one row per unique IP-set
 - `hs_import\policies.csv` — one row per (intent_row × port_tag)
-- `hs_import\policy_group.csv` — timestamped draft group name
+- `hs_import\policy_group.csv` — timestamped group metadata emitted by `flow_to_hs.py`; the current gRPC importer does not read this file
 
 ---
 
-## 3. `import_hs_policy_csv.py` — upload to Hypershield
+## 3. `import_hs_policy.py` — import resources over gRPC
 
-Creates the network objects, creates a draft policy group, and stages every
-policy into that group. **Does not deploy** — you review and push in the
-Hypershield UI when ready.
+Reads the network-object and policy CSVs, validates them, and uses `grpcurl` to call `timescape.intent.v1.IntentService/CreateResource`. It creates `isovalent.com/v1alpha1` `NetworkObjectGroup` resources followed by `isovalent.com/v1alpha1` `SmartSwitchNetworkPolicy` resources in the `hypershield` namespace by default.
 
-### Dry run first
+The importer has no URL or token environment variables and does not read `policy_group.csv`. It passes no authentication option or metadata header to `grpcurl`; access to the specified gRPC service must already work in the environment where the command runs. `grpcurl` is always invoked with `-insecure`.
 
-```bash
-python import_hs_policy_csv.py --objects-csv .\hs_import\network_objects.csv --policies-csv .\hs_import\policies.csv --policy-group-csv .\hs_import\policy_group.csv --dry-run --output-json plan.json
+### Validate and dry-run first
+
+Validation alone does not invoke `grpcurl`:
+
+```powershell
+python import_hs_policy.py --network-objects .\hs_import\network_objects.csv --policies .\hs_import\policies.csv --validate-only
 ```
 
-Logs every API call it *would* make to `plan.json` without sending anything.
-Inspect `plan.json` and `intent.xlsx`; both should make sense before you go live.
+A dry run performs the same validation, prints each `grpcurl` command and its JSON payload, but does not run `grpcurl` or create resources. `--srv` is required, because the rendered command line contains it:
+
+```powershell
+python import_hs_policy.py --srv <hypershield-grpc-host:port> --network-objects .\hs_import\network_objects.csv --policies .\hs_import\policies.csv --dry-run
+```
 
 ### Live run
 
-Set the Hypershield MP API URL and access token, then run the same command without `--dry-run`:
+Pass the gRPC server as `host:port` with `--srv`:
 
 ```powershell
-$env:HS_MP_API_URL = "https://<your-hs-mp-host>/api"
-$env:HS_ACCESS_TOKEN = "<your-token>"
-
-python import_hs_policy_csv.py --objects-csv .\hs_import\network_objects.csv --policies-csv .\hs_import\policies.csv --policy-group-csv .\hs_import\policy_group.csv --output-json result.json
+python import_hs_policy.py --srv <hypershield-grpc-host:port> --network-objects .\hs_import\network_objects.csv --policies .\hs_import\policies.csv
 ```
 
-`HS_MP_API_URL` ends in `/api`.
-`HS_ACCESS_TOKEN` is an API token with permission to edit Hypershield policy.
+The importer validates all inputs before creating anything. On a successful live create, it records each created resource in a change-list JSON file. By default that file is written under `revert_files` with a timestamped name; use `--change-list <path>` to choose it explicitly.
+
+### Importer options
+
+- `--srv <host:port>` — gRPC server passed directly to `grpcurl`; required for dry-run commands that render gRPC calls and for live, list, or revert calls
+- `--namespace <name>` — resource namespace (default: `hypershield`)
+- `--network-objects <path>` — network-object CSV (default: `network_objects.csv`)
+- `--policies <path>` — policy CSV; policies are not imported when omitted
+- `--change-list <path>` — rollback log. A live import writes one whether or not the flag is given; without it, the file is a timestamped JSON under `revert_files`. A revert reads the same flag, and without it uses the newest file in `revert_files`
+- `--dry-run` — print gRPC commands and payloads without invoking `grpcurl`
+- `--validate-only` — validate CSV inputs and create no resources
+- `--allow-missing-refs` — allow policies whose object references are absent from the loaded network-object CSV; other validation errors still stop the run
+- `--limit N` — limit network objects created (and the object set used when validating policy references)
+- `--policy-limit N` — limit grouped policies created
+- `--skip-network-objects` — validate but do not create network objects
+- `--skip-policies` — do not load, validate, or create policies
+- `--list` — list `NetworkObjectGroup` resources through `timescape.intent.v1.IntentService/ListResources`
+- `--revert` — delete resources from a change-list in reverse order through `timescape.intent.v1.IntentService/DeleteResource`; without `--change-list`, uses the newest JSON file in `revert_files`
+- `--stop-on-revert-error` — stop a revert at its first non-not-found error
+
+No output-plan or result JSON option exists. Dry-run output is written to the terminal; the change-list is the live run's local record of created resources.
 
 ---
 
@@ -120,19 +143,15 @@ python import_hs_policy_csv.py --objects-csv .\hs_import\network_objects.csv --p
 # 1. Capture for 30 minutes
 python flow_collector.py --host 10.3.7.206 --user admin --interval 60 --duration 1800 --output-dir .\captures
 
-# 2. Build intent table + HS CSVs
+# 2. Build the intent workbook and importer CSVs
 python flow_to_hs.py .\captures -o intent.xlsx --hs-csv-dir .\hs_import
 
-# 3. Dry-run the upload
-python import_hs_policy_csv.py --objects-csv .\hs_import\network_objects.csv --policies-csv .\hs_import\policies.csv --policy-group-csv .\hs_import\policy_group.csv --dry-run --output-json plan.json
+# 3. Validate locally; no gRPC call is made
+python import_hs_policy.py --network-objects .\hs_import\network_objects.csv --policies .\hs_import\policies.csv --validate-only
 
-# 4. Inspect intent.xlsx and plan.json. Look for surprises.
+# 4. Inspect intent.xlsx and the validation output, then preview every gRPC call
+python import_hs_policy.py --srv <hypershield-grpc-host:port> --network-objects .\hs_import\network_objects.csv --policies .\hs_import\policies.csv --dry-run
 
-# 5. Live push to Hypershield creates draft, does NOT deploy
-$env:HS_MP_API_URL = "https://<your-hs-mp-host>/api"
-$env:HS_ACCESS_TOKEN = "<your-token>"
-
-python import_hs_policy_csv.py --objects-csv .\hs_import\network_objects.csv --policies-csv .\hs_import\policies.csv --policy-group-csv .\hs_import\policy_group.csv --output-json result.json
-
-# 6. Review and deploy the draft in the Hypershield UI.
+# 5. Create the resources and save an explicit rollback change-list
+python import_hs_policy.py --srv <hypershield-grpc-host:port> --network-objects .\hs_import\network_objects.csv --policies .\hs_import\policies.csv --change-list .\revert_files\import.json
 ```

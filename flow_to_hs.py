@@ -32,6 +32,7 @@ ROW-GROUPING RULE (deterministic, two-pass):
 """
 
 import argparse
+import ipaddress
 import re
 import sys
 from collections import defaultdict
@@ -366,6 +367,24 @@ def _parse_port_tag(tag):
     return proto, m.group(2).strip()
 
 
+def _as_cidr(value: str) -> str:
+    """Return an address in CIDR notation.
+
+    The Hypershield intent API validates spec.cidrs entries as CIDRs and
+    rejects a bare host address. A plain IPv4 address gets an explicit /32
+    and a plain IPv6 address a /128. Anything already carrying a prefix
+    length, and anything that is not a plain address, is returned unchanged.
+    """
+    value = value.strip()
+    if not value or "/" in value:
+        return value
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return value
+    return f"{value}/{32 if ip.version == 4 else 128}"
+
+
 def _reset_output_dir(output_dir: Path):
     """
     Prepare an output directory for generated CSV files.
@@ -424,7 +443,7 @@ def write_hs_csvs(rows, output_dir: Path):
             w.writerow([
                 key, key, "",
                 "NETWORK",
-                ";".join(addresses),
+                ";".join(_as_cidr(a) for a in addresses),
                 "", "", "", "", "", "",
             ])
 

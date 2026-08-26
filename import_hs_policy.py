@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import ipaddress
 import json
 import re
 import subprocess
@@ -117,6 +118,25 @@ def grpcurl_call(
         return {}
 
     return json.loads(result.stdout)
+
+
+def as_cidr(value: str) -> str:
+    """Return an address in CIDR notation.
+
+    The intent API validates spec.cidrs entries as CIDRs and rejects a bare
+    host address. A plain IPv4 address gets an explicit /32 and a plain IPv6
+    address a /128. Anything already carrying a prefix length, and anything
+    that is not a plain address, is returned unchanged so that the API
+    reports the problem rather than this function hiding it.
+    """
+    value = value.strip()
+    if not value or "/" in value:
+        return value
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return value
+    return f"{value}/{32 if ip.version == 4 else 128}"
 
 
 def split_values(value: str) -> list[str]:
@@ -498,7 +518,9 @@ def load_network_objects_csv(path: Path) -> list[dict[str, Any]]:
             source_name = (row.get("name") or "").strip()
             name = k8s_name(source_name)
             description = row.get("description") or ""
-            addresses = split_values(row.get("addresses") or "")
+            addresses = [
+                as_cidr(a) for a in split_values(row.get("addresses") or "")
+            ]
             vrfs = split_values(row.get("vrf") or "default")
             object_type = (row.get("object_type") or "").strip().upper()
 
