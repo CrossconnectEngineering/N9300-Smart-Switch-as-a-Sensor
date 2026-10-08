@@ -9,6 +9,7 @@ import subprocess
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+from hypershield_oauth import acquire_token
 from string import Template
 from typing import Any
 
@@ -16,6 +17,8 @@ from typing import Any
 DEFAULT_NAMESPACE = "hypershield"
 DEFAULT_SRV = None
 DEFAULT_REVERT_DIR = "revert_files"
+DEFAULT_TOKEN_FILE = "hs_token.txt"
+AUTH_TOKEN: str | None = None
 
 NETWORK_OBJECT_GVK = {
     "group": "isovalent.com",
@@ -81,6 +84,12 @@ def grpcurl_call(
     cmd = [
         "grpcurl",
         "-insecure",
+    ]
+
+    if AUTH_TOKEN:
+        cmd.extend(["-H", f"Authorization: Bearer {AUTH_TOKEN}"])
+
+    cmd += [
         "-d",
         "@",
         srv,
@@ -958,6 +967,32 @@ def latest_change_list() -> Path:
     return candidates[0]
 
 
+
+def configure_auth(
+    *,
+    no_auth: bool,
+    force_reauth: bool,
+    token_file: str,
+    dry_run: bool,
+) -> None:
+    """Configure bearer-token metadata for live grpcurl calls."""
+    global AUTH_TOKEN
+
+    if no_auth:
+        AUTH_TOKEN = None
+        print("Authentication disabled by --no-auth.")
+        return
+
+    if dry_run:
+        AUTH_TOKEN = None
+        return
+
+    AUTH_TOKEN = acquire_token(
+        force_refresh=force_reauth,
+        token_file=Path(token_file),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Import Hypershield network objects and SmartSwitch policies from CSV."
@@ -985,7 +1020,29 @@ def main() -> None:
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--revert", action="store_true")
     parser.add_argument("--stop-on-revert-error", action="store_true")
+    parser.add_argument(
+        "--token-file",
+        default=DEFAULT_TOKEN_FILE,
+        help=f"Bearer-token cache file (default: {DEFAULT_TOKEN_FILE}).",
+    )
+    parser.add_argument(
+        "--reauth",
+        action="store_true",
+        help="Force a fresh interactive Entra login.",
+    )
+    parser.add_argument(
+        "--no-auth",
+        action="store_true",
+        help="Do not send Authorization metadata (legacy/lab use only).",
+    )
     args = parser.parse_args()
+
+    configure_auth(
+        no_auth=args.no_auth,
+        force_reauth=args.reauth,
+        token_file=args.token_file,
+        dry_run=args.dry_run or args.validate_only,
+    )
 
     if args.change_list:
         change_list_path = Path(args.change_list)
