@@ -85,11 +85,84 @@ The `--hs-csv-dir` flag is optional. Omit it if you only want the xlsx review ar
 
 ---
 
+
+## Microsoft Entra / OIDC authentication
+
+GA Hypershield / Timescape requires bearer-token authentication for API access.
+`import_hs_policy.py` now includes an integrated Microsoft Entra ID login flow
+through `hypershield_oauth.py`; a separate token-generator workflow is not
+required.
+
+Configure the Entra App Registration with this **Web** redirect URI:
+
+```text
+http://localhost:5678/oauth2/callback
+```
+
+The deployment documented for this project uses:
+
+- Public client flows enabled.
+- Implicit Access Token and ID Token grants disabled.
+- A client secret.
+- Microsoft Graph delegated `email` and `User.Read` permissions.
+- Optional `email` and `groups` claims where required by Hypershield RBAC.
+- `groupMembershipClaims` set to `ApplicationGroup` when application-assigned
+  groups are used for authorization.
+
+Create a `.env` file in the repository root:
+
+```text
+HYPERSHIELD_ISSUER=<tenant-id-or-tenant-domain>
+HYPERSHIELD_CLIENT_ID=<application-client-id>
+HYPERSHIELD_CLIENT_SECRET=<client-secret>
+HYPERSHIELD_REDIRECT_URI=http://localhost:5678/oauth2/callback
+HYPERSHIELD_SCOPES=openid profile email
+```
+
+Optional settings:
+
+```text
+HS_OIDC_PROMPT=select_account
+HS_OIDC_EXPECTED_ACCOUNT=user@example.com
+HYPERSHIELD_TOKEN_FILE=hs_token.txt
+```
+
+On the first live operation, or whenever the cached token is expired, the
+importer:
+
+1. Performs OIDC discovery against Microsoft Entra ID.
+2. Starts a temporary callback listener on localhost.
+3. Opens the Entra sign-in page in the default browser.
+4. Uses Authorization Code flow with PKCE.
+5. Exchanges the returned authorization code for tokens.
+6. Writes the Hypershield bearer token to `hs_token.txt`.
+7. Adds `Authorization: Bearer <token>` to subsequent `grpcurl` calls.
+
+Force a fresh login with:
+
+```bash
+python import_hs_policy.py --reauth ...
+```
+
+For older lab deployments that do not require authentication:
+
+```bash
+python import_hs_policy.py --no-auth ...
+```
+
+You can also acquire or refresh only the token:
+
+```bash
+python hypershield_oauth.py
+```
+
+Do not commit `.env`, client secrets, or `hs_token.txt`.
+
 ## 3. `import_hs_policy.py` — import resources over gRPC
 
 Reads the network-object and policy CSVs, validates them, and uses `grpcurl` to call `timescape.intent.v1.IntentService/CreateResource`. It creates `isovalent.com/v1alpha1` `NetworkObjectGroup` resources followed by `isovalent.com/v1alpha1` `SmartSwitchNetworkPolicy` resources in the `hypershield` namespace by default.
 
-The importer has no URL or token environment variables and does not read `policy_group.csv`. It passes no authentication option or metadata header to `grpcurl`; access to the specified gRPC service must already work in the environment where the command runs. `grpcurl` is always invoked with `-insecure`.
+The importer now acquires a Microsoft Entra/OIDC bearer token through `hypershield_oauth.py` and passes it to `grpcurl` as `Authorization: Bearer <token>`. The token is cached locally and reused while valid. `grpcurl` is still invoked with `-insecure`, matching the existing behavior.
 
 ### Validate and dry-run first
 
@@ -116,6 +189,10 @@ python import_hs_policy.py --srv <hypershield-grpc-host:port> --network-objects 
 The importer validates all inputs before creating anything. On a successful live create, it records each created resource in a change-list JSON file. By default that file is written under `revert_files` with a timestamped name; use `--change-list <path>` to choose it explicitly.
 
 ### Importer options
+
+- `--token-file <path>` — bearer-token cache (default: `hs_token.txt`)
+- `--reauth` — force a fresh interactive Entra login
+- `--no-auth` — disable Authorization metadata for unauthenticated legacy/lab deployments
 
 - `--srv <host:port>` — gRPC server passed directly to `grpcurl`; required for dry-run commands that render gRPC calls and for live, list, or revert calls
 - `--namespace <name>` — resource namespace (default: `hypershield`)
